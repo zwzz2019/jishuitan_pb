@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python3 *)",
+      "Bash(ln -s /apdcephfs_tj5/share_302216743/poplarzhang/paiban_yl/scheduler.py /root/scheduler.py)",
+      "Bash(ln -s /apdcephfs_tj5/share_302216743/poplarzhang/paiban_yl/rules.md /root/rules.md)"
+    ]
+  }
+}
