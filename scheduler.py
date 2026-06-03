@@ -23,16 +23,18 @@ DAILY_TARGETS = {
 
 SENIORS = ['陈绪珠', '程晓光', '白荣杰', '闫东', '尤玉华', '赵涛', '翁磊', '孙晶']
 ASSISTANTS = [
-    '陈垒', '季爱华', '曹祯', '陈建安', '杨柳', '赵海清', '王苹', '张庆语',
-    '王子玉', '师欣瑶', '王露瑶', '王可心', '李婉淑', '李柯莹', '王馨', '范闻宇',
+    '陈垒', '季爱华', '陈建安', '杨柳', '赵海清', '王苹',
+    '师欣瑶', '王露瑶', '王可心', '李婉淑', '李柯莹', '王馨', '范闻宇',
     '曾德威', '郝应龙', '林晨', '陈娅', '王业学'
 ]
 NO_MR_ASSIST = [
-    '杨柳', '王苹', '张庆语', '王子玉', '师欣瑶', '王露瑶', '王可心',
+    '杨柳', '王苹', '师欣瑶', '王露瑶', '王可心',
     '李婉淑', '李柯莹', '王馨', '范闻宇'
 ]
-# 半效辅助人：需要2人辅助1个班次
-HALF_EFFICIENCY = ['王苹', '张庆语', '王子玉', '师欣瑶', '李柯莹', '王馨', '范闻宇']
+# 半效辅助人：本周变更——原 7 人全部转为全效辅助，故清空。
+# 注意：清空后 phase5/phase6 中针对 HALF_EFFICIENCY 的成对/独立兜底分支不再触发，
+# 这是有意为之；恢复半效需要把名单填回。
+HALF_EFFICIENCY = []
 # 全效辅助人
 FULL_EFFICIENCY = [a for a in ASSISTANTS if a not in HALF_EFFICIENCY]
 
@@ -103,8 +105,6 @@ def parse_quota(col3_str, name):
     # 特殊硬编码
     if name in ['陈绪珠', '闫东', '尤玉华', '马毅民']:
         return {}, False, {}, 1
-    if name == '翁磊':
-        return {'X': 2, 'CT': 2, 'MR': 1}, True, {}, 1
     if name in ['曾德威', '郝应龙', '陈娅', '王业学']:
         return {'X': 1, 'CT': 2, 'MR': 1}, True, {}, 1
     if name == '林晨':
@@ -113,25 +113,20 @@ def parse_quota(col3_str, name):
         return {'X': 2}, True, {}, 0
     if name == '王玲':
         return {'X': 1, 'MR': 1}, True, {'fixed_days': [3, 4]}, 1
-    if name == '王子玉':
-        # 本周只上1个班(开药++辅助在phase2处理)
-        return {'total': 1}, True, {'pin_day': 0}, 1
-    if name == '王苹':
-        # 周三固定X, 另1个灵活
-        return {'total': 2}, True, {'fixed_wed_x': True}, 1
 
     if not re.search(r'\d', s):
         return {}, False, {}, 1
 
     constraints = {}
-    day_map = {'周一': 0, '周二': 1, '周三': 2, '周四': 3, '周五': 4}
+    day_map = {'一': 0, '二': 1, '三': 2, '四': 3, '五': 4}
 
-    pin_match = re.search(r'(\d*)个?在(周[一二三四五])', s)
+    # rules.md §四：日期指定可写 '在周X' 或 '在星期X' 两种形式
+    pin_match = re.search(r'(\d*)个?在(?:周|星期)([一二三四五])', s)
     if pin_match:
         constraints['pin_day'] = day_map[pin_match.group(2)]
 
     s_clean = re.sub(r'[（(].*?[)）]', '', s)
-    s_clean = re.sub(r'[，,]?\s*\d*个?在周[一二三四五]', '', s_clean).strip('，, ')
+    s_clean = re.sub(r'[，,]?\s*\d*个?在(?:周|星期)[一二三四五]', '', s_clean).strip('，, ')
 
     matches = re.findall(r'(\d+)\s*(X|CT|MR)', s_clean, re.IGNORECASE)
     if matches:
@@ -212,6 +207,11 @@ def load_all(filepath):
             max_mr = 0
             constraints['hui_ji_bai'] = True  # 标记优先排X
 
+        # 个人 MR 禁排日（rules.md §九）
+        # 李新民: 周一不排MR
+        if name == '李新民':
+            constraints['mr_blocked_days'] = [0]
+
         doctors[name] = Doctor(
             name=name, abbr=abbr, row_idx=i, category=category,
             quota=quota, schedule=[None]*5, original=original,
@@ -281,16 +281,23 @@ def find_best_day(shift_type, available_days, used_days, counts, doctor=None, ex
             continue
         if counts[d][shift_type] >= get_upper_limit(d, shift_type):
             continue
+        # 个人 MR 禁排日（rules.md §九，例如李新民周一不排MR）
+        if doctor and shift_type == 'MR' and d in doctor.constraints.get('mr_blocked_days', ()):
+            continue
         if extra_filter and not extra_filter(d):
             continue
         gap = get_target(d, shift_type) - counts[d][shift_type]
         penalty = 0
         if doctor:
             penalty = check_consecutive(doctor, d, shift_type)
-        # 周一有"恰好"约束，优先填满
+        # 周一有"恰好"约束，优先填满。
+        # X/CT：bonus=5 强力把人吸到周一恰好。
+        # MR：每天都"恰好6"，但周一已被陈绪珠占 1，初始 gap 比其他天少 1，
+        # 完全不给 bonus 会让贪心偏离周一（周一最终凑不到 6）；给 +2 把 score 拉
+        # 到与其他天接近，作为 tiebreaker，过强会把 MR 都堆到周一导致后续天不足 6。
         monday_bonus = 0
         if d == 0 and gap > 0:
-            monday_bonus = 5
+            monday_bonus = 5 if shift_type != 'MR' else 2
         # 均衡软约束: 超过8人时递增惩罚(不硬性阻止,只降低优先级)
         balance_penalty = 0
         if d != 0 and counts[d][shift_type] >= 8:
@@ -379,28 +386,31 @@ def assign_quota(doctor, quota_dict, counts, blocked_days=None):
         needed.extend([st] * cnt)
 
     if len(needed) > len(available):
-        # 裁剪: 按原始配额比例+缺口优先级选择
-        # 先按缺口给每个班种评分
-        scored = []
-        for st in needed:
-            if st == 'MR' and doctor.mr_count_this_week >= doctor.max_mr:
-                continue
-            gap = sum(max(0, get_target(d, st) - counts[d][st]) for d in available)
-            # MR有盯机覆盖时给bonus(免费辅助)
-            mr_bonus = 0
-            if st == 'MR' and doctor.name in SENIORS:
-                for d in available:
-                    for aname in ASSISTANTS:
-                        if aname in _doctors_ref:
-                            orig = _doctors_ref[aname].original[d]
-                            if orig and re.match(r'MR\d+盯机', str(orig).strip()):
-                                if can_pair_senior(aname, doctor.name):
-                                    mr_bonus = 10
-                                    break
-                    if mr_bonus: break
-            scored.append((gap + mr_bonus, st))
+        # 配额数 > 可用天数：必须裁剪。
+        # MR 是 §二 的"恰好 6"硬约束，X/CT 只是"≥目标"软约束（不足可由其他人补）。
+        # 个人 MR 配额一周只有 1 次，被裁掉就再也补不回来——天数受限的人尤其如此。
+        # 因此 MR 在裁剪时**优先保留**：先按 (个人 MR 配额, 个人剩余 MR 容量,
+        # 在可用且未被 mr_blocked_days 阻塞的天里 MR 还能塞进去的总 slot) 三者最小值
+        # 决定保留多少个 MR；剩余位置按 X/CT 的当前缺口排序填充。
+        n_avail = len(available)
+        mr_blocked = doctor.constraints.get('mr_blocked_days', ())
+        mr_in_quota = sum(1 for st in needed if st == 'MR')
+        mr_capacity = max(0, doctor.max_mr - doctor.mr_count_this_week)
+        mr_avail_slots = sum(
+            max(0, get_target(d, 'MR') - counts[d]['MR'])
+            for d in available if d not in mr_blocked
+        )
+        mr_to_keep = min(mr_in_quota, mr_capacity, mr_avail_slots, n_avail)
+
+        non_mr = [st for st in needed if st != 'MR']
+        scored = [
+            (sum(max(0, get_target(d, st) - counts[d][st]) for d in available), st)
+            for st in non_mr
+        ]
         scored.sort(reverse=True)
-        needed = [s[1] for s in scored[:len(available)]]
+
+        remaining = n_avail - mr_to_keep
+        needed = ['MR'] * mr_to_keep + [s[1] for s in scored[:remaining]]
 
     used = set()
     # MR first
@@ -482,16 +492,21 @@ def phase1(doctors, counts):
 
     d = doctors['陈绪珠']
     d.schedule[0] = 'MR'; counts[0]['MR'] += 1
-    d.schedule[1] = 'MR'; counts[1]['MR'] += 1
-    d.needs_scheduling = False; d.mr_count_this_week = 2
+    d.needs_scheduling = False; d.mr_count_this_week = 1
 
     d = doctors['程晓光']
     d.schedule[0] = 'X'; counts[0]['X'] += 1
     d.schedule[1] = 'X'; counts[1]['X'] += 1
     d.needs_scheduling = False
 
-    doctors['尤玉华'].needs_scheduling = False
-    doctors['尤玉华'].mr_count_this_week = 1
+    # 尤玉华: §九 排班固定不动 (休/休/休/X/CT)。col2='星期四X，星期五CT' 不被通用
+    # 正则解析；为保证她周四 X、周五 CT 真正落到 schedule 上(而非依赖 original 已填),
+    # 在 phase1 直接写。本周 MR=0。
+    d = doctors['尤玉华']
+    d.schedule[3] = 'X'; counts[3]['X'] += 1
+    d.schedule[4] = 'CT'; counts[4]['CT'] += 1
+    d.needs_scheduling = False
+    d.mr_count_this_week = 0
 
     # 被辅助人中有MR配额的，按MR辅助候选人受限程度排序（最受限的先排）
     seniors_with_mr = []
@@ -516,11 +531,24 @@ def phase1(doctors, counts):
     # 翁磊: 如果还没被seniors_with_mr处理(没有MR配额的情况), 这里处理
     d = doctors['翁磊']
     if d.needs_scheduling:
-        assign_quota(d, {'X': 2, 'CT': 2, 'MR': 1}, counts)
+        # 没有 §九 hardcode 后, 配额完全由 col2 解析；这里只在 phase1 没拿到 MR 配额
+        # (即 col2 不含 MR) 时兜底，按 col2 当前 quota 走 assign_quota.
+        assign_quota(d, {k: v for k, v in d.quota.items()}, counts)
         d.needs_scheduling = False
 
     d = doctors['赵涛']
-    assign_quota(d, {'X': 2}, counts)
+    # §九 赵涛"每周恰好2X，时间随意"。本周周五 5 名全效辅助人参会，senior 辅助资源
+    # 耗尽——让赵涛主动避开周五，减少 1 个 senior 周五 X 班，使周五 senior 辅助缺口
+    # 从 3 降到 2。这是算法选项, 不违 §九 "时间随意"。
+    assign_quota(d, {'X': 2}, counts, blocked_days={4})
+    d.needs_scheduling = False
+
+    d = doctors['白荣杰']
+    # §九 白荣杰 没规定具体日期；同上原因 (周五辅助资源耗尽)，让他避开周五。
+    # col2='3X' 共 3 班，在周一-四 4 天里选 3 天，并不违反任何约束。
+    # 收益：白荣杰移出周五后，杨柳的周五 X 辅助 (pin) 可以让给闫东，使周五 senior
+    # 辅助缺口从 2 降到 1 (尤玉华 CT 仍无辅助)。
+    assign_quota(d, {k: v for k, v in d.quota.items()}, counts, blocked_days={4})
     d.needs_scheduling = False
 
     d = doctors['王玲']
@@ -534,46 +562,60 @@ def phase1(doctors, counts):
         d.schedule[4] = 'MR'; counts[4]['MR'] += 1
     d.needs_scheduling = False; d.mr_count_this_week = 1
 
-    # 过哲: 必须在周三(27号)上班, 有MR盯机所以不排MR
-    d = doctors['过哲']
-    # 周三选X或CT
-    shift = 'X' if (get_target(2, 'X') - counts[2]['X']) >= (get_target(2, 'CT') - counts[2]['CT']) else 'CT'
-    d.schedule[2] = shift
-    counts[2][shift] += 1
-    d.needs_scheduling = False
-
 
 def phase2(doctors, counts):
-    """追加排班 - 不能是MR, 回急白优先X"""
-    normal_pinned = [('胥晓明', 1), ('詹惠荔', 2), ('刘超', 3)]
-    for name, day_idx in normal_pinned:
-        d = doctors[name]
-        # 回急白的人强制X(除非X已到上限)
+    """追加排班 - 处理 pin_day 约束 (§四 列3 写'在周X/在星期X'的人)。
+    - 普通医生：把 1 班放到 pin_day。
+        cell 是 appendable（胃肠/开药+/输卵管）或纯介入 → 设 append_day/append_shift，
+            phase7 渲染为 '<cell>+<shift>'。
+        cell 空 → 直接写 schedule[pin_day]=shift。
+        cell 是其他固定班/复合介入 → 跳过 pin（无处可放）并打印警告。
+        班种：回急白者优先 X（§5.4），否则按当天 X/CT 缺口选（不能 MR，§5.1）。
+    - 辅助人：设 append_day/is_pinned_assist，phase5/phase6 自然把 pin_day 优先安排
+        （依赖 is_asst_available 中已有的 pinned 检查）。
+    """
+    # 普通医生 pin_day
+    for name, d in doctors.items():
+        if d.category == 'assistant':
+            continue
+        pin_day = d.constraints.get('pin_day')
+        if pin_day is None or not d.needs_scheduling:
+            continue
+
         if d.constraints.get('hui_ji_bai'):
-            if counts[day_idx]['X'] < get_upper_limit(day_idx, 'X'):
+            if counts[pin_day]['X'] < get_upper_limit(pin_day, 'X'):
                 shift = 'X'
             else:
                 shift = 'CT'
         else:
-            shift = pick_best_shift_no_mr(day_idx, counts)
-        d.constraints['append_day'] = day_idx
-        d.constraints['append_shift'] = shift
-        counts[day_idx][shift] += 1
+            shift = pick_best_shift_no_mr(pin_day, counts)
+
+        orig = d.original[pin_day]
+        if is_empty(orig):
+            d.schedule[pin_day] = shift
+            counts[pin_day][shift] += 1
+        elif is_appendable(orig) or is_pure_jieru(orig):
+            d.constraints['append_day'] = pin_day
+            d.constraints['append_shift'] = shift
+            counts[pin_day][shift] += 1
+        else:
+            print(f"  ⚠️ {name} pin_day={DAYS[pin_day]} 格子 {orig!r} 不可追加, 跳过 pin")
+            continue
+
         if 'total' in d.quota:
-            d.quota['total'] -= 1
-        d.needs_scheduling = False
+            d.quota['total'] = max(0, d.quota['total'] - 1)
+            if d.quota['total'] <= 0:
+                d.needs_scheduling = False
 
-    asst_pinned = [('曹祯', 4), ('王子玉', 0), ('师欣瑶', 4), ('张庆语', 2)]
-    for name, day_idx in asst_pinned:
-        d = doctors[name]
-        d.constraints['append_day'] = day_idx
+    # 辅助人 pin_day → 让 phase5/phase6 把这一天的辅助优先留给本人
+    for name, d in doctors.items():
+        if d.category != 'assistant':
+            continue
+        pin_day = d.constraints.get('pin_day')
+        if pin_day is None:
+            continue
+        d.constraints['append_day'] = pin_day
         d.constraints['is_pinned_assist'] = True
-        # 不消耗配额 - phase5分配时消耗
-
-    # 王苹: 周三固定X辅助(不消耗配额 - phase5分配时消耗)
-    if '王苹' in doctors:
-        d = doctors['王苹']
-        d.constraints['fixed_wed_x'] = True
 
 
 def pick_best_shift_no_mr(day_idx, counts):
@@ -597,8 +639,7 @@ def phase3(doctors, counts):
             to_assign.append(d)
     to_assign.sort(key=lambda d: sum(d.quota.values()), reverse=True)
     for d in to_assign:
-        blocked = {0, 1} if d.name == '娄露馨' else set()
-        assign_quota(d, {k: v for k, v in d.quota.items()}, counts, blocked)
+        assign_quota(d, {k: v for k, v in d.quota.items()}, counts)
         d.needs_scheduling = False
 
 
@@ -611,8 +652,7 @@ def phase4(doctors, counts):
             to_assign.append(d)
     to_assign.sort(key=lambda d: d.quota.get('total', 0), reverse=True)
     for d in to_assign:
-        blocked = {0, 1} if d.name == '娄露馨' else set()
-        assign_flexible(d, d.quota['total'], counts, blocked)
+        assign_flexible(d, d.quota['total'], counts)
         d.needs_scheduling = False
 
 
@@ -622,7 +662,7 @@ def phase4(doctors, counts):
 def can_pair_senior(asst_name, senior_name):
     """检查盯机辅助人能否覆盖某senior"""
     if senior_name == '陈绪珠':
-        return asst_name in ['季爱华', '曹祯', '赵海清', '林晨', '王业学']
+        return asst_name in ['季爱华', '赵海清', '林晨', '王业学']
     if senior_name == '尤玉华' and asst_name == '师欣瑶':
         return False
     if senior_name in ('程晓光', '翁磊') and asst_name == '杨柳':
@@ -689,19 +729,19 @@ def phase5(doctors, counts):
                     if not any(d == day_idx and asst == c for (d, asst, _, _) in assignments):
                         available_count += 1
             return available_count
-        needs.sort(key=restriction_score)
+        # 排序: 主键 = MAY_LACK_ASSIST 中的 (senior, day) 排在最后 (允许无辅助);
+        #       次键 = restriction_score (候选少的优先).
+        # MAY_LACK_ASSIST: 用户明确允许在辅助资源耗尽时跳过的 senior 班次.
+        # 当前仅闫东周五——周五 5 个全效辅助参会, 闫东 §九 周三四五X 固定无法挪开,
+        # 而尤玉华 §九 周五CT 同样固定但用户要求她必须有辅助; 给闫东周五打低优先级,
+        # 让 杨柳 (周五唯一可调辅助) 先满足尤玉华.
+        MAY_LACK_ASSIST = {('闫东', 4)}
+        needs.sort(key=lambda item: (
+            1 if (item[0], day_idx) in MAY_LACK_ASSIST else 0,
+            restriction_score(item)
+        ))
 
         for senior_name, shift_type in needs:
-            # 王苹周三固定X辅助
-            if day_idx == 2 and shift_type == 'X' and '王苹' in doctors:
-                wp = doctors['王苹']
-                if (wp.constraints.get('fixed_wed_x') and
-                    is_asst_available(wp, 2, assignments) and
-                    has_quota(wp, 'X')):
-                    assignments.append((2, '王苹', senior_name, 'X'))
-                    consume_asst_quota(wp, 'X')
-                    continue
-
             success = assign_one_assist(
                 senior_name, shift_type, day_idx, doctors, assignments
             )
@@ -793,11 +833,11 @@ def get_candidates_by_type(senior_name, shift_type, day_idx, doctors, assignment
 
 def get_candidates(senior_name, shift_type):
     if senior_name == '陈绪珠':
-        return ['季爱华', '曹祯', '赵海清', '林晨', '王业学']
+        return ['季爱华', '赵海清', '林晨', '王业学']
     if senior_name == '白荣杰':
         if shift_type == 'MR':
-            # 只从这5人中选，不考虑其他人
-            return ['陈垒', '季爱华', '曹祯', '陈建安', '赵海清']
+            # 只从这4人中选，不考虑其他人
+            return ['陈垒', '季爱华', '陈建安', '赵海清']
         else:
             return ['王苹'] + [a for a in ASSISTANTS if a != '王苹']
     return list(ASSISTANTS)
@@ -828,10 +868,6 @@ def can_assign_assist(cand_name, shift_type, day_idx, doctors, assignments, seni
     # 有配额
     if not has_quota(cand, shift_type):
         return False
-    # 王苹周三固定X: 周三只能做X辅助
-    if cand_name == '王苹' and cand.constraints.get('fixed_wed_x') and day_idx == 2:
-        if shift_type != 'X':
-            return False
     return True
 
 
@@ -849,16 +885,6 @@ def is_asst_available(doctor, day_idx, existing):
             if not pinned_consumed:
                 if remaining - 1 <= 0:
                     return False
-
-    # 王苹周三固定X: 周三已预留, 其他天只看剩余配额
-    if doctor.name == '王苹' and doctor.constraints.get('fixed_wed_x'):
-        if day_idx == 2:
-            return True  # 周三可用
-        else:
-            # 其他天需要有额外配额
-            wed_consumed = any(d == 2 and asst == '王苹' for (d, asst, _, _) in existing)
-            if not wed_consumed and get_remaining(doctor) <= 0:
-                return False
 
     orig = doctor.original[day_idx]
     sched = doctor.schedule[day_idx]
@@ -1120,6 +1146,83 @@ def phase6_5_optimize(doctors, counts):
     return iterations
 
 
+def fix_mr_shortfall(doctors, counts):
+    """补 MR < 6 的天。
+    思路：贪心+裁剪让某些天的 MR 凑不齐 6（§二 硬约束）。这里做"两人三班"修复——
+      P：当天(short_d) 排了 X/CT 且仍有 MR 容量 → 换成 MR
+      Q：另一天(n)排了同班种 X/CT、那天该班种数 > 目标、且 Q 在 short_d 没班 → 把 Q
+         的 X/CT 从 n 挪到 short_d，顶上 P 让出的格子
+    净效果：short_d 该 X/CT 数不变、short_d MR +1、n 该 X/CT 数 -1（仍 ≥ target）。
+    每次循环只补 1 个 short slot，最多 20 次防止无限循环。
+
+    锁住的人不参与（rules.md §九 中"排班固定不动"或"周X 固定"的人）：
+      程晓光 周一二 X、闫东 周一二主班+周三四五X、陈绪珠 周一 MR+其余主班、
+      尤玉华 全周固定、王玲 周四五 1MR+1X。
+    """
+    LOCKED = {'程晓光', '闫东', '陈绪珠', '尤玉华', '王玲'}
+    iterations = 0
+    while iterations < 20:
+        iterations += 1
+        short_days = [d for d in range(5) if counts[d]['MR'] < get_target(d, 'MR')]
+        if not short_days:
+            break
+        moved = False
+        for short_d in short_days:
+            for p_name, p in doctors.items():
+                if p_name in LOCKED:
+                    continue
+                if p.category == 'assistant':
+                    continue
+                if p.constraints.get('hui_ji_bai'):
+                    continue
+                if short_d in p.constraints.get('mr_blocked_days', ()):
+                    continue
+                if p.mr_count_this_week >= p.max_mr:
+                    continue
+                p_old = p.schedule[short_d]
+                if p_old not in ('X', 'CT'):
+                    continue
+                # 寻找 Q 顶替 P 在 short_d 的 X/CT
+                for q_name, q in doctors.items():
+                    if q is p or q_name in LOCKED or q.category == 'assistant':
+                        continue
+                    if q.original[short_d] is not None:
+                        continue
+                    if q.schedule[short_d] is not None:
+                        continue
+                    # Q 必须在某 n!=short_d 排了 p_old，且那天减 1 仍 ≥ target，且 n!=0（周一恰好）
+                    n_pick = None
+                    for n in range(5):
+                        if n == short_d or n == 0:
+                            continue
+                        if q.schedule[n] != p_old:
+                            continue
+                        if counts[n][p_old] - 1 < get_target(n, p_old):
+                            continue
+                        n_pick = n
+                        break
+                    if n_pick is None:
+                        continue
+                    # 应用 swap
+                    p.schedule[short_d] = 'MR'
+                    counts[short_d][p_old] -= 1
+                    counts[short_d]['MR'] += 1
+                    p.mr_count_this_week += 1
+                    q.schedule[n_pick] = None
+                    counts[n_pick][p_old] -= 1
+                    q.schedule[short_d] = p_old
+                    counts[short_d][p_old] += 1
+                    moved = True
+                    break
+                if moved:
+                    break
+            if moved:
+                break
+        if not moved:
+            break
+    return iterations
+
+
 def can_swap(doc_i, doc_j, day_idx, shift_i, shift_j, counts):
     """检查两人在同一天互换班种是否合法"""
     # 有明确配额的人不能互换(会破坏配额约束)
@@ -1140,6 +1243,12 @@ def can_swap(doc_i, doc_j, day_idx, shift_i, shift_j, counts):
     if shift_j == 'MR' and doc_i.constraints.get('hui_ji_bai'):
         return False
     if shift_i == 'MR' and doc_j.constraints.get('hui_ji_bai'):
+        return False
+
+    # 个人 MR 禁排日（rules.md §九，例如李新民周一不排MR）
+    if shift_j == 'MR' and day_idx in doc_i.constraints.get('mr_blocked_days', ()):
+        return False
+    if shift_i == 'MR' and day_idx in doc_j.constraints.get('mr_blocked_days', ()):
         return False
 
     # 被辅助人不互换(辅助配对会失效)
@@ -1193,7 +1302,7 @@ def phase7(doctors, df, stage1, stage2, filepath):
         """检查辅助人盯机能否配对给某医生(遵循辅助规则)"""
         # 陈绪珠只接受特定辅助人
         if doctor_name == '陈绪珠':
-            allowed = ['季爱华', '曹祯', '赵海清', '林晨', '王业学']
+            allowed = ['季爱华', '赵海清', '林晨', '王业学']
             return asst_name in allowed
         # 尤玉华不接受师欣瑶
         if doctor_name == '尤玉华' and asst_name == '师欣瑶':
@@ -1261,6 +1370,10 @@ def phase7(doctors, df, stage1, stage2, filepath):
                     display = f"介入+{display}"
                 elif orig and is_appendable(orig):
                     display = f"{str(orig).strip()}+{display}"
+                elif orig and str(orig).strip().startswith('介入+'):
+                    # 介入+追加班 复合 cell (例: 杨柳 周五='介入+开药+'): 仍视为可在末尾
+                    # 追加辅助显示, 避免覆盖原 cell 内容。
+                    display = f"{str(orig).strip()}+{display}"
                 ws.cell(row=row, column=col, value=display)
                 continue
 
@@ -1315,7 +1428,7 @@ def validate(counts):
 # Main
 # ============================================================
 def main():
-    filepath = '/apdcephfs_tj5/share_302216743/poplarzhang/paiban_yl/5.25-5.31排班.xlsx'
+    filepath = '/apdcephfs_tj5/share_302216743/poplarzhang/paiban_yl/6.1-6.7排班.xlsx'
 
     print("=" * 50)
     print("医院医生排班程序 v2")
@@ -1348,6 +1461,15 @@ def main():
     print("\n[Phase 4.5] 优化连续班种...")
     iters = phase6_5_optimize(doctors, counts)
     print(f"  优化{iters}轮")
+
+    print("\n[Phase 4.6] 补 MR 短缺(两人三班 swap)...")
+    fix_iters = fix_mr_shortfall(doctors, counts)
+    print(f"  尝试{fix_iters}轮")
+    print("  分配后:")
+    for d in range(5):
+        c = counts[d]
+        print(f"    {DAYS[d]}: X={c['X']}, CT={c['CT']}, MR={c['MR']}")
+    ok = validate(counts)
 
     print("\n[Phase 5] 第一阶段辅助...")
     s1 = phase5(doctors, counts)
